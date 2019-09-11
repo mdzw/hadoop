@@ -19,6 +19,10 @@
 package org.apache.hadoop.fs.s3a;
 
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.s3a.impl.StatusProbeEnum;
+import org.apache.hadoop.fs.s3a.impl.StoreContext;
+import org.apache.hadoop.fs.s3a.s3guard.DDBPathMetadata;
+import org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore;
 import org.apache.hadoop.fs.s3a.s3guard.MetadataStore;
 import org.apache.hadoop.fs.s3a.s3guard.NullMetadataStore;
 import org.junit.Assume;
@@ -36,6 +40,45 @@ import static org.apache.hadoop.fs.contract.ContractTestUtils.touch;
  * of the MetadataStore.
  */
 public class ITestS3GuardEmptyDirs extends AbstractS3ATestBase {
+
+  @Test
+  public void testRenameEmptyDir() throws Throwable {
+    S3AFileSystem fs = getFileSystem();
+    Path basePath = path(getMethodName());
+    Path sourceDir = new Path(basePath, "AAA-source");
+    String sourceDirMarker = fs.pathToKey(sourceDir) + "/";
+    Path destDir = new Path(basePath, "BBB-dest");
+    String destDirMarker = fs.pathToKey(destDir) + "/";
+    // set things up.
+    mkdirs(sourceDir);
+    // there'a source directory marker
+    fs.getObjectMetadata(sourceDirMarker);
+    S3AFileStatus srcStatus = getEmptyDirStatus(sourceDir);
+    assertEquals("Must be an empty dir: " + srcStatus, Tristate.TRUE,
+        srcStatus.isEmptyDirectory());
+    // do the rename
+    assertRenameOutcome(fs, sourceDir, destDir, true);
+    S3AFileStatus destStatus = getEmptyDirStatus(destDir);
+    assertEquals("Must be an empty dir: " + destStatus, Tristate.TRUE,
+        destStatus.isEmptyDirectory());
+    // source does not exist.
+    intercept(FileNotFoundException.class,
+        () -> getEmptyDirStatus(sourceDir));
+    // and verify that there's no dir marker hidden under a tombstone
+    intercept(FileNotFoundException.class,
+        () -> Invoker.once("HEAD", sourceDirMarker,
+            () -> fs.getObjectMetadata(sourceDirMarker)));
+    // the parent dir mustn't be confused
+    S3AFileStatus baseStatus = getEmptyDirStatus(basePath);
+    assertEquals("Must not be an empty dir: " + baseStatus, Tristate.FALSE,
+        baseStatus.isEmptyDirectory());
+    // and verify the dest dir has a marker
+    fs.getObjectMetadata(destDirMarker);
+  }
+
+  private S3AFileStatus getEmptyDirStatus(Path dir) throws IOException {
+    return getFileSystem().innerGetFileStatus(dir, true, StatusProbeEnum.ALL);
+  }
 
   @Test
   public void testEmptyDirs() throws Exception {
@@ -60,21 +103,22 @@ public class ITestS3GuardEmptyDirs extends AbstractS3ATestBase {
       Path newFile = path("existing-dir/new-file");
       touch(fs, newFile);
 
-      S3AFileStatus status = fs.innerGetFileStatus(existingDir, true);
+      S3AFileStatus status = fs.innerGetFileStatus(existingDir, true,
+          StatusProbeEnum.ALL);
       assertEquals("Should not be empty dir", Tristate.FALSE,
           status.isEmptyDirectory());
 
       // 3. Assert that removing the only file the MetadataStore witnessed
       // being created doesn't cause it to think the directory is now empty.
       fs.delete(newFile, false);
-      status = fs.innerGetFileStatus(existingDir, true);
+      status = fs.innerGetFileStatus(existingDir, true, StatusProbeEnum.ALL);
       assertEquals("Should not be empty dir", Tristate.FALSE,
           status.isEmptyDirectory());
 
       // 4. Assert that removing the final file, that existed "before"
       // MetadataStore started, *does* cause the directory to be marked empty.
       fs.delete(existingFile, false);
-      status = fs.innerGetFileStatus(existingDir, true);
+      status = fs.innerGetFileStatus(existingDir, true, StatusProbeEnum.ALL);
       assertEquals("Should be empty dir now", Tristate.TRUE,
           status.isEmptyDirectory());
     } finally {

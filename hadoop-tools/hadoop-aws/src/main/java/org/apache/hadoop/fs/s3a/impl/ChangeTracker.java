@@ -83,6 +83,11 @@ public class ChangeTracker {
     this.policy = checkNotNull(policy);
     this.uri = uri;
     this.versionMismatches = versionMismatches;
+    this.revisionId = policy.getRevisionId(s3ObjectAttributes);
+    if (revisionId != null) {
+      LOG.debug("Tracker {} has revision ID for object at {}: {}",
+          policy, uri, revisionId);
+    }
   }
 
   public String getRevisionId() {
@@ -187,7 +192,7 @@ public class ChangeTracker {
   public String toString() {
     final StringBuilder sb = new StringBuilder(
         "ChangeTracker{");
-    sb.append("changeDetectionPolicy=").append(policy);
+    sb.append(policy);
     sb.append(", revisionId='").append(revisionId).append('\'');
     sb.append('}');
     return sb.toString();

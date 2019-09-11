@@ -87,6 +87,20 @@ import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.s3a.impl.ChangeDetectionPolicy;
+import org.apache.hadoop.fs.s3a.impl.ContextAccessors;
+import org.apache.hadoop.fs.s3a.impl.CopyOutcome;
+import org.apache.hadoop.fs.s3a.impl.DeleteOperation;
+import org.apache.hadoop.fs.s3a.impl.InternalConstants;
+import org.apache.hadoop.fs.s3a.impl.MultiObjectDeleteSupport;
+import org.apache.hadoop.fs.s3a.impl.OperationCallbacks;
+import org.apache.hadoop.fs.s3a.impl.RenameOperation;
+import org.apache.hadoop.fs.s3a.impl.StatusProbeEnum;
+import org.apache.hadoop.fs.s3a.impl.StoreContext;
+import org.apache.hadoop.fs.s3a.s3guard.BulkOperationState;
+import org.apache.hadoop.fs.s3a.select.InternalSelectConstants;
+import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.util.DurationInfo;
+import org.apache.hadoop.util.LambdaUtils;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -126,6 +140,12 @@ import static org.apache.hadoop.fs.s3a.S3AUtils.getServerSideEncryptionKey;
 import static org.apache.hadoop.fs.s3a.Statistic.*;
 import static org.apache.commons.lang3.StringUtils.isNotBlank;
 import static org.apache.commons.lang3.StringUtils.isNotEmpty;
+import static org.apache.hadoop.fs.s3a.auth.RolePolicies.STATEMENT_ALLOW_SSE_KMS_RW;
+import static org.apache.hadoop.fs.s3a.auth.RolePolicies.allowS3Operations;
+import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.TokenIssuingPolicy.NoTokensAvailable;
+import static org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens.hasDelegationTokenBinding;
+import static org.apache.hadoop.fs.s3a.impl.InternalConstants.SC_404;
+import static org.apache.hadoop.io.IOUtils.cleanupWithLogger;
 
 /**
  * The core S3A Filesystem implementation.
@@ -789,8 +809,14 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
     String key = pathToKey(path);
     FileStatus status = null;
     try {
-      // get the status or throw an FNFE
-      status = getFileStatus(path);
+      // get the status or throw an FNFE.
+      // when overwriting, there is no need to look for any existing file,
+      // and attempting to do so can poison the load balancers with 404
+      // entries.
+      status = innerGetFileStatus(path, false,
+          overwrite
+              ? StatusProbeEnum.DIRECTORIES
+              : StatusProbeEnum.ALL);
 
       // if the thread reaches here, there is something at the path
       if (status.isDirectory()) {
@@ -953,7 +979,8 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
 
     // get the source file status; this raises a FNFE if there is no source
     // file.
-    S3AFileStatus srcStatus = innerGetFileStatus(src, true);
+    S3AFileStatus srcStatus = innerGetFileStatus(src, true,
+        StatusProbeEnum.ALL);
 
     if (srcKey.equals(dstKey)) {
       LOG.debug("rename: src and dest refer to the same file or directory: {}",
@@ -965,7 +992,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
 
     S3AFileStatus dstStatus = null;
     try {
-      dstStatus = innerGetFileStatus(dst, true);
+      dstStatus = innerGetFileStatus(dst, true, StatusProbeEnum.ALL);
       // if there is no destination entry, an exception is raised.
       // hence this code sequence can assume that there is something
       // at the end of the path; the only detail being what it is and
@@ -998,7 +1025,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
       if (!pathToKey(parent).isEmpty()) {
         try {
           S3AFileStatus dstParentStatus = innerGetFileStatus(dst.getParent(),
-              false);
+              false, StatusProbeEnum.ALL);
           if (!dstParentStatus.isDirectory()) {
             throw new RenameFailedException(src, dst,
                 "destination parent is not a directory");
@@ -1287,7 +1314,15 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
     ObjectMetadata meta = invoker.retryUntranslated("GET " + key, true,
         () -> {
           incrementStatistic(OBJECT_METADATA_REQUESTS);
-          return s3.getObjectMetadata(request);
+          LOG.debug("HEAD {} with change tracker {}", key, changeTracker);
+          if (changeTracker != null) {
+            changeTracker.maybeApplyConstraint(request);
+          }
+          ObjectMetadata objectMetadata = s3.getObjectMetadata(request);
+          if (changeTracker != null) {
+            changeTracker.processMetadata(objectMetadata, operation);
+          }
+          return objectMetadata;
         });
     incrementReadOperations();
     return meta;
@@ -1749,7 +1784,13 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
   public boolean delete(Path f, boolean recursive) throws IOException {
     try {
       entryPoint(INVOCATION_DELETE);
-      boolean outcome = innerDelete(innerGetFileStatus(f, true), recursive);
+      DeleteOperation deleteOperation = new DeleteOperation(
+          createStoreContext(),
+          innerGetFileStatus(f, true, StatusProbeEnum.ALL),
+          recursive,
+          operationCallbacks,
+          InternalConstants.MAX_ENTRIES_TO_DELETE);
+      boolean outcome = deleteOperation.execute();
       if (outcome) {
         try {
           maybeCreateFakeParentDirectory(f);
@@ -1881,13 +1922,15 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
    * Retry policy: retrying; untranslated.
    * @param f path to create
    * @throws IOException IO problem
-   * @throws AmazonClientException untranslated AWS client problem
    */
   @Retries.RetryTranslated
   private void createFakeDirectoryIfNecessary(Path f)
       throws IOException, AmazonClientException {
     String key = pathToKey(f);
-    if (!key.isEmpty() && !s3Exists(f)) {
+    // we only make the LIST call; the codepaths to get here should not
+    // be reached if there is an empty dir marker -and if they do, it
+    // is mostly harmless to create a new one.
+    if (!key.isEmpty() && !s3Exists(f, EnumSet.of(StatusProbeEnum.List))) {
       LOG.debug("Creating new fake directory at {}", f);
       createFakeDirectory(key);
     }
@@ -1898,7 +1941,6 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
    * That is: it parent is not the root path and does not yet exist.
    * @param path whose parent is created if needed.
    * @throws IOException IO problem
-   * @throws AmazonClientException untranslated AWS client problem
    */
   @Retries.RetryTranslated
   void maybeCreateFakeParentDirectory(Path path)
@@ -2140,14 +2182,23 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
    */
   @Retries.RetryTranslated
   public FileStatus getFileStatus(final Path f) throws IOException {
-    return innerGetFileStatus(f, false);
+    entryPoint(INVOCATION_GET_FILE_STATUS);
+    return innerGetFileStatus(f, false, StatusProbeEnum.ALL);
   }
 
   /**
+   * Get the status of a file or directory, first through S3Guard and then
+   * through S3.
+   * The S3 probes can leave 404 responses in the S3 load balancers; if
+   * a check is only needed for a directory, declaring this saves time and
+   * avoids creating one for the object.
+   * When only probing for directories, if an entry for a file is found in
+   * S3Guard it is returned, but checks for updated values are skipped.
    * Internal version of {@link #getFileStatus(Path)}.
    * @param f The path we want information from
    * @param needEmptyDirectoryFlag if true, implementation will calculate
    *        a TRUE or FALSE value for {@link S3AFileStatus#isEmptyDirectory()}
+   * @param probes probes to make
    * @return a S3AFileStatus object
    * @throws FileNotFoundException when the path does not exist
    * @throws IOException on other problems.
@@ -2155,8 +2206,8 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
   @VisibleForTesting
   @Retries.RetryTranslated
   S3AFileStatus innerGetFileStatus(final Path f,
-      boolean needEmptyDirectoryFlag) throws IOException {
-    entryPoint(INVOCATION_GET_FILE_STATUS);
+      final boolean needEmptyDirectoryFlag,
+      final Set<StatusProbeEnum> probes) throws IOException {
     final Path path = qualify(f);
     String key = pathToKey(path);
     LOG.debug("Getting path status for {}  ({})", path, key);
@@ -2166,11 +2217,51 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
     Set<Path> tombstones = Collections.emptySet();
     if (pm != null) {
       if (pm.isDeleted()) {
-        throw new FileNotFoundException("Path " + f + " is recorded as " +
-            "deleted by S3Guard");
+        OffsetDateTime deletedAt = OffsetDateTime.ofInstant(
+            Instant.ofEpochMilli(pm.getFileStatus().getModificationTime()),
+            ZoneOffset.UTC);
+        throw new FileNotFoundException("Path " + path + " is recorded as " +
+            "deleted by S3Guard at " + deletedAt);
       }
 
-      FileStatus msStatus = pm.getFileStatus();
+      // if ms is not authoritative, check S3 if there's any recent
+      // modification - compare the modTime to check if metadata is up to date
+      // Skip going to s3 if the file checked is a directory. Because if the
+      // dest is also a directory, there's no difference.
+      // TODO After HADOOP-16085 the modification detection can be done with
+      //  etags or object version instead of modTime
+      boolean allowAuthoritative = allowAuthoritative(path);
+      if (!pm.getFileStatus().isDirectory() &&
+          !allowAuthoritative &&
+          probes.contains(StatusProbeEnum.Head)) {
+        // a file has been found in a non-auth path and the caller has not said
+        // they only care about directories
+        LOG.debug("Metadata for {} found in the non-auth metastore.", path);
+        final long msModTime = pm.getFileStatus().getModificationTime();
+
+        S3AFileStatus s3AFileStatus;
+        try {
+          s3AFileStatus = s3GetFileStatus(path, key, probes, tombstones);
+        } catch (FileNotFoundException fne) {
+          s3AFileStatus = null;
+        }
+        if (s3AFileStatus == null) {
+          LOG.warn("Failed to find file {}. Either it is not yet visible, or "
+              + "it has been deleted.", path);
+        } else {
+          final long s3ModTime = s3AFileStatus.getModificationTime();
+
+          if(s3ModTime > msModTime) {
+            LOG.debug("S3Guard metadata for {} is outdated;"
+                + " s3modtime={}; msModTime={} updating metastore",
+                path, s3ModTime, msModTime);
+            return S3Guard.putAndReturn(metadataStore, s3AFileStatus,
+                instrumentation, ttlTimeProvider);
+          }
+        }
+      }
+
+      S3AFileStatus msStatus = pm.getFileStatus();
       if (needEmptyDirectoryFlag && msStatus.isDirectory()) {
         if (pm.isEmptyDirectory() != Tristate.UNKNOWN) {
           // We have a definitive true / false from MetadataStore, we are done.
@@ -2191,7 +2282,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
       // S3 yet, we'll assume the empty directory is true;
       S3AFileStatus s3FileStatus;
       try {
-        s3FileStatus = s3GetFileStatus(path, key, tombstones);
+        s3FileStatus = s3GetFileStatus(path, key, probes, tombstones);
       } catch (FileNotFoundException e) {
         return S3AFileStatus.fromFileStatus(msStatus, Tristate.TRUE);
       }
@@ -2201,7 +2292,9 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
       // there was no entry in S3Guard
       // retrieve the data and update the metadata store in the process.
       return S3Guard.putAndReturn(metadataStore,
-          s3GetFileStatus(path, key, tombstones), instrumentation);
+          s3GetFileStatus(path, key, StatusProbeEnum.ALL, tombstones),
+          instrumentation,
+          ttlTimeProvider);
     }
   }
 
@@ -2212,14 +2305,18 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
    * Retry policy: retry translated.
    * @param path Qualified path
    * @param key  Key string for the path
+   * @param probes probes to make
+   * @param tombstones tombstones to filter
    * @return Status
    * @throws FileNotFoundException when the path does not exist
    * @throws IOException on other problems.
    */
   @Retries.RetryTranslated
-  private S3AFileStatus s3GetFileStatus(final Path path, String key,
-      Set<Path> tombstones) throws IOException {
-    if (!key.isEmpty()) {
+  private S3AFileStatus s3GetFileStatus(final Path path,
+      String key,
+      final Set<StatusProbeEnum> probes,
+      final Set<Path> tombstones) throws IOException {
+    if (!key.isEmpty() && probes.contains(StatusProbeEnum.Head)) {
       try {
         ObjectMetadata meta = getObjectMetadata(key);
 
@@ -2235,15 +2332,15 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
               username);
         }
       } catch (AmazonServiceException e) {
-        if (e.getStatusCode() != 404) {
+        if (e.getStatusCode() != SC_404) {
           throw translateException("getFileStatus", path, e);
         }
       } catch (AmazonClientException e) {
         throw translateException("getFileStatus", path, e);
       }
 
-      // Necessary?
-      if (!key.endsWith("/")) {
+      // Look for the dir marker
+      if (!key.endsWith("/") && probes.contains(StatusProbeEnum.DirMarker)) {
         String newKey = key + "/";
         try {
           ObjectMetadata meta = getObjectMetadata(newKey);
@@ -2262,7 +2359,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
                     username);
           }
         } catch (AmazonServiceException e) {
-          if (e.getStatusCode() != 404) {
+          if (e.getStatusCode() != SC_404) {
             throw translateException("getFileStatus", newKey, e);
           }
         } catch (AmazonClientException e) {
@@ -2271,39 +2368,42 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
       }
     }
 
-    try {
-      key = maybeAddTrailingSlash(key);
-      S3ListRequest request = createListObjectsRequest(key, "/", 1);
+    // execute the list
+    if (probes.contains(StatusProbeEnum.List)) {
+      try {
+        key = maybeAddTrailingSlash(key);
+        S3ListRequest request = createListObjectsRequest(key, "/", 1);
 
-      S3ListResult objects = listObjects(request);
+        S3ListResult objects = listObjects(request);
 
-      Collection<String> prefixes = objects.getCommonPrefixes();
-      Collection<S3ObjectSummary> summaries = objects.getObjectSummaries();
-      if (!isEmptyOfKeys(prefixes, tombstones) ||
-          !isEmptyOfObjects(summaries, tombstones)) {
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("Found path as directory (with /): {}/{}",
-              prefixes.size(), summaries.size());
+        Collection<String> prefixes = objects.getCommonPrefixes();
+        Collection<S3ObjectSummary> summaries = objects.getObjectSummaries();
+        if (!isEmptyOfKeys(prefixes, tombstones) ||
+            !isEmptyOfObjects(summaries, tombstones)) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Found path as directory (with /): {}/{}",
+                prefixes.size(), summaries.size());
 
-          for (S3ObjectSummary summary : summaries) {
-            LOG.debug("Summary: {} {}", summary.getKey(), summary.getSize());
+            for (S3ObjectSummary summary : summaries) {
+              LOG.debug("Summary: {} {}", summary.getKey(), summary.getSize());
+            }
+            for (String prefix : prefixes) {
+              LOG.debug("Prefix: {}", prefix);
+            }
           }
-          for (String prefix : prefixes) {
-            LOG.debug("Prefix: {}", prefix);
-          }
+
+          return new S3AFileStatus(Tristate.FALSE, path, username);
+        } else if (key.isEmpty()) {
+          LOG.debug("Found root directory");
+          return new S3AFileStatus(Tristate.TRUE, path, username);
         }
-
-        return new S3AFileStatus(Tristate.FALSE, path, username);
-      } else if (key.isEmpty()) {
-        LOG.debug("Found root directory");
-        return new S3AFileStatus(Tristate.TRUE, path, username);
-      }
-    } catch (AmazonServiceException e) {
-      if (e.getStatusCode() != 404) {
+      } catch (AmazonServiceException e) {
+        if (e.getStatusCode() != SC_404) {
+          throw translateException("getFileStatus", path, e);
+        }
+      } catch (AmazonClientException e) {
         throw translateException("getFileStatus", path, e);
       }
-    } catch (AmazonClientException e) {
-      throw translateException("getFileStatus", path, e);
     }
 
     LOG.debug("Not Found: {}", path);
@@ -2356,15 +2456,17 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
    * Raw version of {@link FileSystem#exists(Path)} which uses S3 only:
    * S3Guard MetadataStore, if any, will be skipped.
    * Retry policy: retrying; translated.
+   * @param path qualified path to look for
+   * @param probes probes to make
    * @return true if path exists in S3
    * @throws IOException IO failure
    */
   @Retries.RetryTranslated
-  private boolean s3Exists(final Path f) throws IOException {
-    Path path = qualify(f);
+  private boolean s3Exists(final Path path, final Set<StatusProbeEnum> probes)
+      throws IOException {
     String key = pathToKey(path);
     try {
-      s3GetFileStatus(path, key, null);
+      s3GetFileStatus(path, key, probes, null);
       return true;
     } catch (FileNotFoundException e) {
       return false;
@@ -2585,7 +2687,47 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
       }
     };
 
-    once("copyFile(" + srcKey + ", " + dstKey + ")", srcKey,
+    ChangeTracker changeTracker = new ChangeTracker(
+        keyToQualifiedPath(srcKey).toString(),
+        changeDetectionPolicy,
+        readContext.instrumentation.newInputStreamStatistics()
+            .getVersionMismatchCounter(),
+        srcAttributes);
+
+    String action = "copyFile(" + srcKey + ", " + dstKey + ")";
+    Invoker readInvoker = readContext.getReadInvoker();
+
+    ObjectMetadata srcom;
+    try {
+      srcom = once(action, srcKey,
+          () ->
+              getObjectMetadata(srcKey, changeTracker, readInvoker, "copy"));
+    } catch (FileNotFoundException e) {
+      // if rename fails at this point it means that the expected file was not
+      // found.
+      // The cause is believed to always be one of
+      //  - File was deleted since LIST/S3Guard metastore.list.() knew of it.
+      //  - S3Guard is asking for a specific version and it's been removed by
+      //    lifecycle rules.
+      //  - there's a 404 cached in the S3 load balancers.
+      LOG.debug("getObjectMetadata({}) failed to find an expected file",
+          srcKey, e);
+      // We create an exception, but the text depends on the S3Guard state
+      String message = hasMetadataStore()
+          ? RemoteFileChangedException.FILE_NEVER_FOUND
+          : RemoteFileChangedException.FILE_NOT_FOUND_SINGLE_ATTEMPT;
+      throw new RemoteFileChangedException(
+          keyToQualifiedPath(srcKey).toString(),
+          action,
+          message,
+          e);
+    }
+    ObjectMetadata dstom = cloneObjectMetadata(srcom);
+    setOptionalObjectMetadata(dstom);
+
+    return readInvoker.retry(
+        action, srcKey,
+        true,
         () -> {
           ObjectMetadata srcom = getObjectMetadata(srcKey);
           ObjectMetadata dstom = cloneObjectMetadata(srcom);
