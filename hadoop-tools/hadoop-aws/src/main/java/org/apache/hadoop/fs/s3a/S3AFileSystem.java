@@ -788,6 +788,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
     final Path path = qualify(f);
     String key = pathToKey(path);
     FileStatus status = null;
+    /*
     try {
       // get the status or throw an FNFE
       status = getFileStatus(path);
@@ -806,6 +807,7 @@ public class S3AFileSystem extends FileSystem implements StreamCapabilities {
       // this means the file is not found
 
     }
+    */
     instrumentation.fileCreated();
     PutTracker putTracker =
         committerIntegration.createTracker(path, key);
